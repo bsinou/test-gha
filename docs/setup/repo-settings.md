@@ -65,8 +65,6 @@ itself, just repo hygiene.
 
 ## 5. PAT for the auto-merge bot identity
 
-for the tims being, made a classic PAT for 90 days for bsinou-agent
-
 **Problem:** `prepare-release.yml` used to call `gh pr create` / `gh pr merge --auto`
 with the default `github.token`. GitHub attributes any event caused by that
 token — including a merge completed later by auto-merge — to `github-actions[bot]`,
@@ -80,17 +78,22 @@ instead of `github.token` for this kind of step.
 **Fix:** create a personal access token (PAT) and store it as a repo secret,
 so the merge is attributed to a real account instead of `github-actions[bot]`.
 
-1. On the GitHub account that should own these automated merges, go to
-   `Settings → Developer settings → Personal access tokens → Fine-grained tokens`
-   (classic tokens work too, but fine-grained lets you scope to one repo).
-2. **Generate new token**, restrict **Repository access** to `bsinou/test-gha`
-   only.
-3. Under **Repository permissions**, grant:
-   - **Contents**: Read and write
-   - **Pull requests**: Read and write
-4. Generate the token and copy it (shown once).
-5. In `bsinou/test-gha`: `Settings → Secrets and variables → Actions → New repository secret`.
-6. Name it `RELEASE_BOT_TOKEN`, paste the token value, save.
+A fine-grained token scoped to just `bsinou/test-gha` was tried first but
+didn't work (fine-grained tokens don't yet support `gh pr merge`/some PR
+mutations the way classic tokens do) — used a **classic PAT** instead, for
+the `bsinou-agent` account:
+
+1. On the `bsinou-agent` account, go to
+   `Settings → Developer settings → Personal access tokens → Tokens (classic)`.
+2. **Generate new token (classic)**, expiration **90 days**, scope: **`repo`**
+   (classic tokens can't be restricted to a single repository — this grants
+   `bsinou-agent` access to whatever repos it can see, which is fine for a
+   dedicated bot account with no other access).
+3. Generate the token and copy it (shown once).
+4. In `bsinou/test-gha`: `Settings → Secrets and variables → Actions → New repository secret`.
+5. Name it `RELEASE_BOT_TOKEN`, paste the token value, save.
+6. Since it's a 90-day classic token, it'll need regenerating and swapping
+   into the secret again before it expires.
 
 `prepare-release.yml`'s `Create pull request` and `Enable auto-merge` steps
 now authenticate with `secrets.RELEASE_BOT_TOKEN` instead of `github.token`,
