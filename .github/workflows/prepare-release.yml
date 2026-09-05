@@ -1,0 +1,151 @@
+name: Prepare release
+
+# Test-harness mirror of wire-team-settings' prepare-release.yml (ADR 0006
+# PREPARED -> VALIDATED -> PUBLISHED process). Identical git/PR mechanics;
+# the Docker/Helm candidate "publication" steps are mocked to log-only since
+# this repo has no real registry/S3 to push to.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Branch to release from: main, or a maintained release/X.Y line'
+        type: string
+        default: main
+        required: false
+      type:
+        description: 'Release channel'
+        type: choice
+        options: [ga, alpha, beta, rc]
+        default: ga
+        required: true
+      version_bump:
+        description: 'Only applies for type=ga promoting from a GA (ignored for pre-releases and for promoting a pre-release to GA)'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: Prepare release candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v7
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Resolve source commit
+        id: source
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Resolved source_ref '${{ inputs.source_ref }}' to $sha"
+
+      - name: Compute target version
+        id: version
+        run: |
+          set -euo pipefail
+          target=$(./bin/compute-release-version.sh "${{ inputs.source_ref }}" "${{ inputs.type }}" "${{ inputs.version_bump }}")
+          from_tag=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --abbrev=0 "origin/${{ inputs.source_ref }}")
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "from_tag=$from_tag" >> "$GITHUB_OUTPUT"
+          echo "Target version: $target (changelog from $from_tag)"
+
+      - name: Configure git
+        run: |
+          git config user.email "zebot@users.noreply.github.com"
+          git config user.name "Zebot"
+
+      - name: Create prepare branch
+        run: git checkout -b "prepare/v${{ steps.version.outputs.target }}" "${{ steps.source.outputs.sha }}"
+
+      - name: Generate changelog
+        run: node bin/generate-release-changelog.js "${{ steps.version.outputs.from_tag }}" "${{ steps.source.outputs.sha }}"
+
+      - name: Commit changelog
+        run: |
+          git add CHANGELOG.md
+          git commit -m "chore: release ${{ steps.version.outputs.target }} — changelog"
+
+      - name: Build production bundle (mocked — no real build in this test repo)
+        env:
+          APP_VERSION: ${{ steps.version.outputs.target }}
+        run: echo "[MOCK] Would build production bundle for APP_VERSION=$APP_VERSION"
+
+      - name: Push candidate Docker image (mocked — publication is not performed in this test repo)
+        id: docker
+        run: |
+          set -euo pipefail
+          repo="quay.io/wire/team-settings"
+          candidate_tag="${{ steps.version.outputs.target }}-candidate"
+          digest="sha256:$(echo -n "${{ steps.source.outputs.sha }}" | sha256sum | cut -d' ' -f1)"
+
+          echo "repository=$repo" >> "$GITHUB_OUTPUT"
+          echo "candidate_tag=$candidate_tag" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "[MOCK] Would push Docker candidate image: ${repo}:${candidate_tag} @ ${digest}"
+
+      - name: Package candidate Helm chart (mocked — publication is not performed in this test repo)
+        id: helm
+        run: |
+          set -euo pipefail
+          target="${{ steps.version.outputs.target }}"
+          package_file="team-settings-${target}.tgz"
+          sha256=$(echo -n "$target" | sha256sum | cut -d' ' -f1)
+          candidate_path="candidates/${package_file}"
+
+          echo "candidate_path=$candidate_path" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+          echo "[MOCK] Would upload Helm candidate chart to s3://public.wire.com/charts-webapp/${candidate_path} (sha256 $sha256)"
+
+      - name: Write release manifest
+        run: |
+          set -euo pipefail
+          cat > release-manifest.json <<JSON
+          {
+            "version": "${{ steps.version.outputs.target }}",
+            "type": "${{ inputs.type }}",
+            "source_ref": "${{ inputs.source_ref }}",
+            "source_commit": "${{ steps.source.outputs.sha }}",
+            "docker_repository": "${{ steps.docker.outputs.repository }}",
+            "docker_candidate_tag": "${{ steps.docker.outputs.candidate_tag }}",
+            "docker_digest": "${{ steps.docker.outputs.digest }}",
+            "helm_candidate_path": "${{ steps.helm.outputs.candidate_path }}",
+            "helm_sha256": "${{ steps.helm.outputs.sha256 }}",
+            "prepare_run_id": "${{ github.run_id }}"
+          }
+          JSON
+          git add release-manifest.json
+          git commit -m "chore: release ${{ steps.version.outputs.target }} — manifest"
+
+      - name: Push prepare branch
+        run: git push origin "prepare/v${{ steps.version.outputs.target }}"
+
+      - name: Create pull request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create \
+            --title "chore: Prepare release ${{ steps.version.outputs.target }}" \
+            --body "Automated release preparation for \`${{ steps.version.outputs.target }}\` (\`${{ inputs.type }}\`) from \`${{ inputs.source_ref }}\` @ \`${{ steps.source.outputs.sha }}\`.
+
+          [MOCK] Candidate artifacts are simulated in this test repo (no real registry/S3 push), recorded in \`release-manifest.json\`:
+          - Docker: \`${{ steps.docker.outputs.repository }}:${{ steps.docker.outputs.candidate_tag }}\` (\`${{ steps.docker.outputs.digest }}\`)
+          - Helm: \`${{ steps.helm.outputs.candidate_path }}\` (sha256 \`${{ steps.helm.outputs.sha256 }}\`)
+
+          **This PR must be merged as a merge commit.** Squash or rebase merges discard the commit ancestry that \`publish-release\` relies on to verify the candidate, and will be rejected at publish time.
+
+          After merging, run the \`publish-release\` workflow with this PR's number to publish it." \
+            --base "${{ inputs.source_ref }}" \
+            --head "prepare/v${{ steps.version.outputs.target }}"

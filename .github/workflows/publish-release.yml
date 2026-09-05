@@ -1,0 +1,210 @@
+name: Publish release
+
+# Test-harness mirror of wire-team-settings' publish-release.yml (ADR 0006
+# publication step). Identical verification/tag/release mechanics; the
+# Docker/Helm "promotion" steps are mocked to log-only since this repo has
+# no real registry/S3 to promote to.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Number of the merged prepare-release PR to publish'
+        type: number
+        required: true
+
+permissions: {}
+
+jobs:
+  # ── 1. RESOLVE PR ────────────────────────────────────────────────────────────
+  resolve-pr:
+    name: Resolve prepare-release PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+
+    outputs:
+      state: ${{ steps.pr.outputs.state }}
+      merge_sha: ${{ steps.pr.outputs.merge_sha }}
+      base_ref: ${{ steps.pr.outputs.base_ref }}
+
+    steps:
+      - name: Look up PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          data=$(gh pr view "${{ inputs.pr_number }}" --repo "${{ github.repository }}" \
+            --json state,mergeCommit,baseRefName,headRefName,title)
+
+          state=$(jq -r '.state' <<<"$data")
+          merge_sha=$(jq -r '.mergeCommit.oid // empty' <<<"$data")
+          base_ref=$(jq -r '.baseRefName' <<<"$data")
+
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "PR #${{ inputs.pr_number }}: state=$state base_ref=$base_ref merge_sha=$merge_sha"
+
+  # ── 2. PUBLISH ───────────────────────────────────────────────────────────────
+  publish:
+    name: Publish
+    needs: resolve-pr
+    if: needs.resolve-pr.outputs.state == 'MERGED'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout base ref
+        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v7
+        with:
+          ref: ${{ needs.resolve-pr.outputs.base_ref }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Verify merge is a true merge commit
+        id: verify_merge
+        run: |
+          set -euo pipefail
+          merge_sha="${{ needs.resolve-pr.outputs.merge_sha }}"
+          if [[ -z "$merge_sha" ]]; then
+            echo "error: PR #${{ inputs.pr_number }} has no recorded merge commit" >&2
+            exit 1
+          fi
+
+          # A true merge commit has exactly 2 parents. Squash and rebase merges
+          # produce a 1-parent commit and are rejected — see prepare-release.yml.
+          parents=$(git rev-list --parents -n1 "$merge_sha")
+          parent_count=$(( $(wc -w <<<"$parents") - 1 ))
+          if [[ "$parent_count" -ne 2 ]]; then
+            echo "error: merge commit $merge_sha has $parent_count parent(s), expected 2 (true merge, not squash/rebase). Re-merge PR #${{ inputs.pr_number }} as a merge commit and re-run this workflow." >&2
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor "$merge_sha" HEAD; then
+            echo "error: merge commit $merge_sha is not part of ${{ needs.resolve-pr.outputs.base_ref }}'s history" >&2
+            exit 1
+          fi
+
+          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Read and verify release manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          merge_sha="${{ steps.verify_merge.outputs.merge_sha }}"
+
+          git show "${merge_sha}:release-manifest.json" > /tmp/release-manifest.json
+
+          source_commit=$(jq -r '.source_commit' /tmp/release-manifest.json)
+          if ! git merge-base --is-ancestor "$source_commit" "$merge_sha"; then
+            echo "error: manifest source_commit $source_commit is not an ancestor of merge commit $merge_sha — manifest does not match this candidate" >&2
+            exit 1
+          fi
+
+          for key in version type source_commit docker_repository docker_candidate_tag docker_digest helm_candidate_path helm_sha256; do
+            value=$(jq -r ".$key" /tmp/release-manifest.json)
+            echo "${key}=${value}" >> "$GITHUB_OUTPUT"
+          done
+          echo "Verified manifest for version ${source_commit:0:7} @ $(jq -r .version /tmp/release-manifest.json)"
+
+      - name: Promote Docker image (mocked — publication is not performed in this test repo)
+        run: |
+          set -euo pipefail
+          repo="${{ steps.manifest.outputs.docker_repository }}"
+          candidate_ref="${repo}:${{ steps.manifest.outputs.docker_candidate_tag }}"
+          release_ref="${repo}:${{ steps.manifest.outputs.version }}"
+          expected_digest="${{ steps.manifest.outputs.docker_digest }}"
+
+          echo "[MOCK] Would verify candidate digest for $candidate_ref matches $expected_digest"
+          echo "[MOCK] Would promote (no rebuild): $candidate_ref -> $release_ref"
+
+      - name: Promote Helm chart (mocked — publication is not performed in this test repo)
+        run: |
+          set -euo pipefail
+          target="${{ steps.manifest.outputs.version }}"
+          expected_sha256="${{ steps.manifest.outputs.helm_sha256 }}"
+          package_file="team-settings-${target}.tgz"
+
+          echo "[MOCK] Would fetch s3://public.wire.com/charts-webapp/${{ steps.manifest.outputs.helm_candidate_path }} and verify sha256 $expected_sha256"
+          echo "[MOCK] Would publish $package_file to charts-webapp"
+
+      - name: Publish release manifest
+        run: |
+          set -euo pipefail
+          target="${{ steps.manifest.outputs.version }}"
+          cp /tmp/release-manifest.json "release-manifest-v${target}.json"
+          git config user.email "zebot@users.noreply.github.com"
+          git config user.name "Zebot"
+          git add "release-manifest-v${target}.json"
+          git commit -m "chore: publish release manifest for v${target}"
+          git push origin "HEAD:${{ needs.resolve-pr.outputs.base_ref }}"
+
+      - name: Create immutable release tag
+        run: |
+          set -euo pipefail
+          target="${{ steps.manifest.outputs.version }}"
+          source_commit="${{ steps.manifest.outputs.source_commit }}"
+
+          if git rev-parse -q --verify "refs/tags/v${target}" >/dev/null; then
+            existing=$(git rev-parse "refs/tags/v${target}")
+            if [[ "$existing" == "$source_commit" ]]; then
+              echo "Tag v${target} already exists at the expected commit — treating as already completed."
+            else
+              echo "error: tag v${target} already exists at $existing, expected $source_commit — refusing to move an existing release tag" >&2
+              exit 1
+            fi
+          else
+            git tag "v${target}" "$source_commit"
+            git push origin "v${target}"
+            echo "Created tag v${target} at $source_commit"
+          fi
+
+      - name: Create or verify release/X.Y for first GA of a new minor
+        if: steps.manifest.outputs.type == 'ga'
+        run: |
+          set -euo pipefail
+          target="${{ steps.manifest.outputs.version }}"
+          source_commit="${{ steps.manifest.outputs.source_commit }}"
+
+          if [[ "$target" =~ ^([0-9]+)\.([0-9]+)\.0$ ]]; then
+            line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            if git ls-remote --exit-code --heads origin "release/${line}" >/dev/null 2>&1; then
+              existing=$(git ls-remote --heads origin "release/${line}" | awk '{print $1}')
+              if [[ "$existing" == "$source_commit" ]]; then
+                echo "release/${line} already exists at the expected commit — treating as already completed."
+              else
+                echo "error: release/${line} already exists at $existing, expected $source_commit — refusing to move an existing maintenance branch" >&2
+                exit 1
+              fi
+            else
+              git push origin "${source_commit}:refs/heads/release/${line}"
+              echo "Created release/${line} at $source_commit"
+            fi
+          else
+            echo "Not the first GA of a new minor (patch != 0) — no maintenance branch created."
+          fi
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target="${{ steps.manifest.outputs.version }}"
+          merge_sha="${{ steps.verify_merge.outputs.merge_sha }}"
+          git show "${merge_sha}:CHANGELOG.md" > /tmp/CHANGELOG.md
+
+          release_args=(--title "v${target}" --notes-file /tmp/CHANGELOG.md)
+          if [[ "${{ steps.manifest.outputs.type }}" != "ga" ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          if gh release view "v${target}" >/dev/null 2>&1; then
+            echo "GitHub release v${target} already exists — treating as already completed."
+          else
+            gh release create "v${target}" "${release_args[@]}"
+          fi
