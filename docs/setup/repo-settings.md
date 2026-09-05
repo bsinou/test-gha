@@ -53,6 +53,50 @@ Combined with the ruleset above, this lets `prepare-release.yml` call
 and completes by itself as soon as the required approval is given, which in
 turn fires `publish-release.yml`'s `pull_request: closed` trigger.
 
+## 4. Delete head branches automatically after merge
+
+`Settings → General → Pull Requests`
+
+- **Automatically delete head branches**: enabled.
+
+Keeps stale `prepare/vX.Y.Z-*` branches from piling up in the repo once
+their PR is merged (or closed) — nothing to do with the release logic
+itself, just repo hygiene.
+
+## 5. PAT for the auto-merge bot identity
+
+for the tims being, made a classic PAT for 90 days for bsinou-agent
+
+**Problem:** `prepare-release.yml` used to call `gh pr create` / `gh pr merge --auto`
+with the default `github.token`. GitHub attributes any event caused by that
+token — including a merge completed later by auto-merge — to `github-actions[bot]`,
+and per GitHub's anti-recursion rule, **events triggered by the default
+`GITHUB_TOKEN` never start other workflow runs**. Result: the merge happened,
+but `publish-release.yml`'s `pull_request: closed` trigger silently never
+fired (not even as a "skipped" run) — this is the same reason
+wire-team-settings' real workflows use `secrets.OTTO_THE_BOT_GH_TOKEN`
+instead of `github.token` for this kind of step.
+
+**Fix:** create a personal access token (PAT) and store it as a repo secret,
+so the merge is attributed to a real account instead of `github-actions[bot]`.
+
+1. On the GitHub account that should own these automated merges, go to
+   `Settings → Developer settings → Personal access tokens → Fine-grained tokens`
+   (classic tokens work too, but fine-grained lets you scope to one repo).
+2. **Generate new token**, restrict **Repository access** to `bsinou/test-gha`
+   only.
+3. Under **Repository permissions**, grant:
+   - **Contents**: Read and write
+   - **Pull requests**: Read and write
+4. Generate the token and copy it (shown once).
+5. In `bsinou/test-gha`: `Settings → Secrets and variables → Actions → New repository secret`.
+6. Name it `RELEASE_BOT_TOKEN`, paste the token value, save.
+
+`prepare-release.yml`'s `Create pull request` and `Enable auto-merge` steps
+now authenticate with `secrets.RELEASE_BOT_TOKEN` instead of `github.token`,
+so the resulting merge shows up as performed by that account and correctly
+fires `publish-release.yml`.
+
 ## Net effect on the operator flow
 
 With all three settings in place, releasing is:

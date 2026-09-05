@@ -134,7 +134,7 @@ jobs:
 
       - name: Create pull request
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: |
           gh pr create \
             --title "chore: Prepare release ${{ steps.version.outputs.target }}" \
@@ -152,5 +152,5 @@ jobs:
 
       - name: Enable auto-merge
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
         run: gh pr merge --auto --merge "prepare/v${{ steps.version.outputs.target }}"

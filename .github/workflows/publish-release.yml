@@ -139,17 +139,6 @@ jobs:
           echo "[MOCK] Would fetch s3://public.wire.com/charts-webapp/${{ steps.manifest.outputs.helm_candidate_path }} and verify sha256 $expected_sha256"
           echo "[MOCK] Would publish $package_file to charts-webapp"
 
-      - name: Publish release manifest
-        run: |
-          set -euo pipefail
-          target="${{ steps.manifest.outputs.version }}"
-          cp /tmp/release-manifest.json "release-manifest-v${target}.json"
-          git config user.email "zebot@users.noreply.github.com"
-          git config user.name "Zebot"
-          git add "release-manifest-v${target}.json"
-          git commit -m "chore: publish release manifest for v${target}"
-          git push origin "HEAD:${{ needs.resolve-pr.outputs.base_ref }}"
-
       - name: Create immutable release tag
         run: |
           set -euo pipefail
@@ -203,6 +192,7 @@ jobs:
           target="${{ steps.manifest.outputs.version }}"
           merge_sha="${{ steps.verify_merge.outputs.merge_sha }}"
           git show "${merge_sha}:CHANGELOG.md" > /tmp/CHANGELOG.md
+          cp /tmp/release-manifest.json "/tmp/release-manifest-v${target}.json"
 
           release_args=(--title "v${target}" --notes-file /tmp/CHANGELOG.md)
           if [[ "${{ steps.manifest.outputs.type }}" != "ga" ]]; then
@@ -212,5 +202,5 @@ jobs:
           if gh release view "v${target}" >/dev/null 2>&1; then
             echo "GitHub release v${target} already exists — treating as already completed."
           else
-            gh release create "v${target}" "${release_args[@]}"
+            gh release create "v${target}" "/tmp/release-manifest-v${target}.json" "${release_args[@]}"
           fi
