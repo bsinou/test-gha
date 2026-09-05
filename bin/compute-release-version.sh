@@ -7,7 +7,11 @@
 # Usage: ./bin/compute-release-version.sh <source_ref> <type> <version_bump>
 #   source_ref:    dev, or a maintained release/X.Y line
 #   type:          ga | alpha | beta | rc
-#   version_bump:  patch | minor | major (only applies for type=ga promoting a GA)
+#   version_bump:  patch | minor | major — applies whenever promoting from a GA
+#                  (any type: ga, alpha, beta, rc). Ignored when the latest
+#                  reachable release is already a pre-release (channel bump is
+#                  fixed there: alphaNN -> alpha(NN+1), or alpha -> beta01, etc.)
+#                  and when promoting an existing pre-release to GA.
 #
 # Requires a checkout with full tag history (fetch-depth: 0) and source_ref
 # fetched and resolvable as "origin/<source_ref>".
@@ -101,10 +105,9 @@ if [[ "$latest" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-(alpha|beta|rc)([0-9]+)$ ]]; then
   fi
 elif [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   # Latest reachable release is a GA.
-  if [[ "$type" == "ga" ]]; then
-    target=$(bump_version "$latest" "$version_bump")
-  else
-    target="$(bump_version "$latest" patch)-${type}01"
+  target=$(bump_version "$latest" "$version_bump")
+  if [[ "$type" != "ga" ]]; then
+    target="${target}-${type}01"
   fi
 else
   echo "error: could not parse latest reachable release tag '${latest_tag}'" >&2

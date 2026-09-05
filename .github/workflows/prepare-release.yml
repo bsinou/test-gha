@@ -20,7 +20,7 @@ on:
         default: ga
         required: true
       version_bump:
-        description: 'Only applies for type=ga promoting from a GA (ignored for pre-releases and for promoting a pre-release to GA)'
+        description: 'Applies whenever promoting from a GA, for any type (ga, alpha, beta, rc). Ignored when the latest reachable release is already a pre-release, and when promoting an existing pre-release to GA'
         type: choice
         options: [patch, minor, major]
         default: patch
@@ -57,7 +57,18 @@ jobs:
         run: |
           set -euo pipefail
           target=$(./bin/compute-release-version.sh "${{ inputs.source_ref }}" "${{ inputs.type }}" "${{ inputs.version_bump }}")
-          from_tag=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --abbrev=0 "origin/${{ inputs.source_ref }}")
+
+          # Changelog boundary: GA releases summarize everything since the last
+          # GA; pre-releases summarize everything since the last pre-release
+          # (any channel), falling back to the last GA for the first pre-release
+          # of a new cycle.
+          if [[ "${{ inputs.type }}" == "ga" ]]; then
+            from_tag=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --exclude "v*-*" --abbrev=0 "origin/${{ inputs.source_ref }}")
+          else
+            from_tag=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*-*" --abbrev=0 "origin/${{ inputs.source_ref }}" 2>/dev/null || \
+              git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --exclude "v*-*" --abbrev=0 "origin/${{ inputs.source_ref }}")
+          fi
+
           echo "target=$target" >> "$GITHUB_OUTPUT"
           echo "from_tag=$from_tag" >> "$GITHUB_OUTPUT"
           echo "Target version: $target (changelog from $from_tag)"
@@ -69,6 +80,14 @@ jobs:
 
       - name: Create prepare branch
         run: git checkout -b "pre-release/v${{ steps.version.outputs.target }}" "${{ steps.source.outputs.sha }}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install changelog dependencies
+        run: npm ci
 
       - name: Generate changelog
         run: node bin/generate-release-changelog.js "${{ steps.version.outputs.from_tag }}" "${{ steps.source.outputs.sha }}"
