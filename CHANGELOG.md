@@ -1,5 +1,10 @@
-## fff634dd6b9fe4ad40ae78020ef691b02b1897d9 (since v0.1.1-alpha01)
+## 5f1ef411396314bd3fa63883ae5f9beb97a47774 (since v0.1.1-alpha01)
 
+- Merge branch 'main' of https://github.com/bsinou/test-gha (5f1ef41)
+- feat: more docs (d98a8ac)
+- Merge pull request #5 from bsinou/prepare/v0.1.1-alpha02 (64b81de)
+- chore: release 0.1.1-alpha02 — manifest (67f1f59)
+- chore: release 0.1.1-alpha02 — changelog (70d9fd0)
 - feat: auto-merge prepare PR and auto-trigger publish on merge (fff634d)
 - chore: publish release manifest for v0.1.1-alpha01 (fe5a6da)
 - chore: Prepare release 0.1.1-alpha01 (50924ca)
