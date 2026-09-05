@@ -1,12 +1,12 @@
 {
-  "version": "0.1.1-beta02",
-  "type": "beta",
+  "version": "0.1.1",
+  "type": "ga",
   "source_ref": "main",
-  "source_commit": "849e05bd7b56fc1b34b76909e27e9192b3de5f95",
+  "source_commit": "e183d3ab2e8627d2dca511be2c69649fb71e54ef",
   "docker_repository": "quay.io/wire/team-settings",
-  "docker_candidate_tag": "0.1.1-beta02-candidate",
-  "docker_digest": "sha256:0617d3b4703a143d28e045ec7fbac1c641da75cc948d0a88b09c611fe3fca5f0",
-  "helm_candidate_path": "candidates/team-settings-0.1.1-beta02.tgz",
-  "helm_sha256": "1183fc9fa5c09b94932fc3707ba23599716777dd3a96203673cd42a677572b47",
-  "prepare_run_id": "33986946371"
+  "docker_candidate_tag": "0.1.1-candidate",
+  "docker_digest": "sha256:10414b9855c46e35e7f2c9a6322637c593f279b33fe18c27d89cdec948f90f12",
+  "helm_candidate_path": "candidates/team-settings-0.1.1.tgz",
+  "helm_sha256": "11ee23b8fc2fc619d6eab6277adb5a527261067ac01ccfc3e11857f55bf18bcd",
+  "prepare_run_id": "33987163215"
 }
