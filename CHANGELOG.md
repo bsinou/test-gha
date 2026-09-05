@@ -1,5 +1,11 @@
-## 5f1ef411396314bd3fa63883ae5f9beb97a47774 (since v0.1.1-alpha01)
+## 27ec18ca13cdff5bb2ddd4e36140088bdf4e1ab8 (since v0.1.1-alpha01)
 
+- feat: rather use an axisting bot agent to performn the releease (27ec18c)
+- chore: cleaning (a76d4d9)
+- docs: recap manual repo settings for release-process testing (855ed67)
+- Merge pull request #7 from bsinou/prepare/v0.1.1-beta01 (77099ba)
+- chore: release 0.1.1-beta01 — manifest (ce5c6db)
+- chore: release 0.1.1-beta01 — changelog (ea64493)
 - Merge branch 'main' of https://github.com/bsinou/test-gha (5f1ef41)
 - feat: more docs (d98a8ac)
 - Merge pull request #5 from bsinou/prepare/v0.1.1-alpha02 (64b81de)
