@@ -146,6 +146,11 @@ jobs:
 
           **This PR must be merged as a merge commit.** Squash or rebase merges discard the commit ancestry that \`publish-release\` relies on to verify the candidate, and will be rejected at publish time.
 
-          After merging, run the \`publish-release\` workflow with this PR's number to publish it." \
+          Auto-merge is enabled — approve this PR and it will merge and publish itself." \
             --base "${{ inputs.source_ref }}" \
             --head "prepare/v${{ steps.version.outputs.target }}"
+
+      - name: Enable auto-merge
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: gh pr merge --auto --merge "prepare/v${{ steps.version.outputs.target }}"
