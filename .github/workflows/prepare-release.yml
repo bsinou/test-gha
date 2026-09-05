@@ -68,15 +68,10 @@ jobs:
           git config user.name "Zebot"
 
       - name: Create prepare branch
-        run: git checkout -b "prepare/v${{ steps.version.outputs.target }}" "${{ steps.source.outputs.sha }}"
+        run: git checkout -b "pre-release/v${{ steps.version.outputs.target }}" "${{ steps.source.outputs.sha }}"
 
       - name: Generate changelog
         run: node bin/generate-release-changelog.js "${{ steps.version.outputs.from_tag }}" "${{ steps.source.outputs.sha }}"
-
-      - name: Commit changelog
-        run: |
-          git add CHANGELOG.md
-          git commit -m "chore: release ${{ steps.version.outputs.target }} — changelog"
 
       - name: Build production bundle (mocked — no real build in this test repo)
         env:
@@ -126,11 +121,11 @@ jobs:
             "prepare_run_id": "${{ github.run_id }}"
           }
           JSON
-          git add release-manifest.json
-          git commit -m "chore: release ${{ steps.version.outputs.target }} — manifest"
+          git add CHANGELOG.md release-manifest.json
+          git commit -m "chore(release): v${{ steps.version.outputs.target }}"
 
       - name: Push prepare branch
-        run: git push origin "prepare/v${{ steps.version.outputs.target }}"
+        run: git push origin "pre-release/v${{ steps.version.outputs.target }}"
 
       - name: Create pull request
         env:
@@ -148,9 +143,9 @@ jobs:
 
           Auto-merge is enabled — approve this PR and it will merge and publish itself." \
             --base "${{ inputs.source_ref }}" \
-            --head "prepare/v${{ steps.version.outputs.target }}"
+            --head "pre-release/v${{ steps.version.outputs.target }}"
 
       - name: Enable auto-merge
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
-        run: gh pr merge --auto --merge "prepare/v${{ steps.version.outputs.target }}"
+        run: gh pr merge --auto --merge "pre-release/v${{ steps.version.outputs.target }}"

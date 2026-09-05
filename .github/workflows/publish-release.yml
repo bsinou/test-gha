@@ -21,7 +21,7 @@ jobs:
   # ── 1. RESOLVE PR ────────────────────────────────────────────────────────────
   resolve-pr:
     name: Resolve prepare-release PR
-    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'prepare/'))
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'pre-release/'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
