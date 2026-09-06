@@ -4,119 +4,145 @@ name: Publish release
 # publication step). Identical verification/tag/release mechanics; the
 # Docker/Helm "promotion" steps are mocked to log-only since this repo has
 # no real registry/S3 to promote to.
+#
+# The PREPARED candidate is a draft GitHub Release created by prepare-release.
+# Publication is triggered either automatically when that draft is published
+# (a human clicked "Publish release"), or manually as a fallback.
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
-      pr_number:
-        description: 'Number of the merged prepare-release PR to publish (manual override — normally auto-resolved from the merge event)'
-        type: number
-        required: false
-  pull_request:
-    types: [closed]
+      version:
+        description: 'Version to publish, e.g. 1.0.1 or 1.1.0-rc01 (leading v optional). Manual fallback — normally the draft is published from the Releases page.'
+        type: string
+        required: true
 
 permissions: {}
 
 jobs:
-  # ── 1. RESOLVE PR ────────────────────────────────────────────────────────────
-  resolve-pr:
-    name: Resolve prepare-release PR
-    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.merged == true && startsWith(github.event.pull_request.head.ref, 'pre-release/'))
+  # ── 1. RESOLVE RELEASE ───────────────────────────────────────────────────────
+  resolve-release:
+    name: Resolve release
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      pull-requests: read
+      contents: read
 
     outputs:
-      pr_number: ${{ steps.pr.outputs.pr_number }}
-      state: ${{ steps.pr.outputs.state }}
-      merge_sha: ${{ steps.pr.outputs.merge_sha }}
-      base_ref: ${{ steps.pr.outputs.base_ref }}
+      target: ${{ steps.release.outputs.target }}
+      release_id: ${{ steps.release.outputs.release_id }}
+      is_draft: ${{ steps.release.outputs.is_draft }}
+      target_commitish: ${{ steps.release.outputs.target_commitish }}
+      manifest_asset_url: ${{ steps.release.outputs.manifest_asset_url }}
 
     steps:
-      - name: Look up PR
-        id: pr
+      - name: Look up release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          RAW_VERSION: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
         run: |
           set -euo pipefail
-          data=$(gh pr view "$PR_NUMBER" --repo "${{ github.repository }}" \
-            --json state,mergeCommit,baseRefName,headRefName,title)
+          target="${RAW_VERSION#v}"
 
-          state=$(jq -r '.state' <<<"$data")
-          merge_sha=$(jq -r '.mergeCommit.oid // empty' <<<"$data")
-          base_ref=$(jq -r '.baseRefName' <<<"$data")
+          # /releases/tags/<tag> does not return drafts — must list and filter.
+          matches="$(
+            gh api --paginate "/repos/${{ github.repository }}/releases" \
+              --jq "[.[] | select(.tag_name == \"v${target}\")]"
+          )"
+          count="$(jq 'length' <<<"$matches")"
 
-          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "state=$state" >> "$GITHUB_OUTPUT"
-          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
-          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
-          echo "PR #$PR_NUMBER: state=$state base_ref=$base_ref merge_sha=$merge_sha"
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error title=No release found::No release found for v${target} — run prepare-release first."
+            exit 1
+          fi
+          if [[ "$count" -gt 1 ]]; then
+            echo "::error title=Multiple releases found::Multiple releases share tag v${target} — resolve manually:"
+            jq -r '.[] | "  - \(.html_url)"' <<<"$matches" >&2
+            exit 1
+          fi
+
+          release_id="$(jq -r '.[0].id' <<<"$matches")"
+          is_draft="$(jq -r '.[0].draft' <<<"$matches")"
+          target_commitish="$(jq -r '.[0].target_commitish' <<<"$matches")"
+          # browser_download_url 404s for a draft's assets — must use the API url.
+          manifest_asset_url="$(jq -r '.[0].assets[] | select(.name == "release-manifest.json") | .url' <<<"$matches")"
+
+          if [[ -z "$manifest_asset_url" ]]; then
+            echo "::error title=No manifest asset::Release v${target} has no release-manifest.json asset; it was not produced by prepare-release."
+            exit 1
+          fi
+
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "is_draft=$is_draft" >> "$GITHUB_OUTPUT"
+          echo "target_commitish=$target_commitish" >> "$GITHUB_OUTPUT"
+          echo "manifest_asset_url=$manifest_asset_url" >> "$GITHUB_OUTPUT"
+          echo "Release v${target}: id=$release_id draft=$is_draft target_commitish=$target_commitish"
 
   # ── 2. PUBLISH ───────────────────────────────────────────────────────────────
   publish:
     name: Publish
-    needs: resolve-pr
-    if: needs.resolve-pr.outputs.state == 'MERGED'
+    needs: resolve-release
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write
 
     steps:
-      - name: Checkout base ref
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v7
-        with:
-          ref: ${{ needs.resolve-pr.outputs.base_ref }}
-          fetch-depth: 0
-          token: ${{ github.token }}
-
-      - name: Verify merge is a true merge commit
-        id: verify_merge
+      - name: Download release manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          merge_sha="${{ needs.resolve-pr.outputs.merge_sha }}"
-          if [[ -z "$merge_sha" ]]; then
-            echo "error: PR #${{ needs.resolve-pr.outputs.pr_number }} has no recorded merge commit" >&2
-            exit 1
-          fi
-
-          # A true merge commit has exactly 2 parents. Squash and rebase merges
-          # produce a 1-parent commit and are rejected — see prepare-release.yml.
-          parents=$(git rev-list --parents -n1 "$merge_sha")
-          parent_count=$(( $(wc -w <<<"$parents") - 1 ))
-          if [[ "$parent_count" -ne 2 ]]; then
-            echo "error: merge commit $merge_sha has $parent_count parent(s), expected 2 (true merge, not squash/rebase). Re-merge PR #${{ needs.resolve-pr.outputs.pr_number }} as a merge commit and re-run this workflow." >&2
-            exit 1
-          fi
-
-          if ! git merge-base --is-ancestor "$merge_sha" HEAD; then
-            echo "error: merge commit $merge_sha is not part of ${{ needs.resolve-pr.outputs.base_ref }}'s history" >&2
-            exit 1
-          fi
-
-          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          gh api -H "Accept: application/octet-stream" \
+            "${{ needs.resolve-release.outputs.manifest_asset_url }}" \
+            > /tmp/release-manifest.json
+          jq . /tmp/release-manifest.json
 
       - name: Read and verify release manifest
         id: manifest
         run: |
           set -euo pipefail
-          merge_sha="${{ steps.verify_merge.outputs.merge_sha }}"
 
-          git show "${merge_sha}:release-manifest.json" > /tmp/release-manifest.json
-
-          source_commit=$(jq -r '.source_commit' /tmp/release-manifest.json)
-          if ! git merge-base --is-ancestor "$source_commit" "$merge_sha"; then
-            echo "error: manifest source_commit $source_commit is not an ancestor of merge commit $merge_sha — manifest does not match this candidate" >&2
-            exit 1
-          fi
-
-          for key in version type source_commit docker_repository docker_candidate_tag docker_digest helm_candidate_path helm_sha256; do
+          for key in version type source_branch source_commit docker_repository docker_candidate_tag docker_digest helm_candidate_path helm_sha256; do
             value=$(jq -r ".$key" /tmp/release-manifest.json)
             echo "${key}=${value}" >> "$GITHUB_OUTPUT"
           done
-          echo "Verified manifest for version ${source_commit:0:7} @ $(jq -r .version /tmp/release-manifest.json)"
+
+          version="$(jq -r '.version' /tmp/release-manifest.json)"
+          if [[ "$version" != "${{ needs.resolve-release.outputs.target }}" ]]; then
+            echo "error: manifest version $version does not match resolved release v${{ needs.resolve-release.outputs.target }}" >&2
+            exit 1
+          fi
+
+          source_commit="$(jq -r '.source_commit' /tmp/release-manifest.json)"
+          if [[ "$source_commit" != "${{ needs.resolve-release.outputs.target_commitish }}" ]]; then
+            echo "error: manifest source_commit $source_commit does not match the release's target_commitish ${{ needs.resolve-release.outputs.target_commitish }} — the draft was retargeted after preparation" >&2
+            exit 1
+          fi
+
+          echo "Verified manifest for version $version @ ${source_commit:0:7}"
+
+      - name: Checkout source branch
+        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v7
+        with:
+          ref: ${{ steps.manifest.outputs.source_branch }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Verify candidate is still on its source branch
+        run: |
+          set -euo pipefail
+          source_commit="${{ steps.manifest.outputs.source_commit }}"
+          source_branch="${{ steps.manifest.outputs.source_branch }}"
+          if ! git merge-base --is-ancestor "$source_commit" "origin/${source_branch}"; then
+            echo "::error title=Stale candidate::source_commit ${source_commit} is no longer an ancestor of ${source_branch} — the branch was rewritten since preparation. Delete this release and re-run prepare-release."
+            exit 1
+          fi
+          echo "Candidate ${source_commit} is still reachable from ${source_branch}."
 
       - name: Promote Docker image (mocked — publication is not performed in this test repo)
         run: |
@@ -144,6 +170,8 @@ jobs:
           set -euo pipefail
           target="${{ steps.manifest.outputs.version }}"
           source_commit="${{ steps.manifest.outputs.source_commit }}"
+
+          git fetch --tags --force origin
 
           if git rev-parse -q --verify "refs/tags/v${target}" >/dev/null; then
             existing=$(git rev-parse "refs/tags/v${target}")
@@ -184,23 +212,30 @@ jobs:
             echo "Not the first GA of a new minor (patch != 0) — no maintenance branch created."
           fi
 
-      - name: Create GitHub release
+      - name: Publish draft release
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          # Must be github.token: the resulting release event must NOT re-trigger
+          # this workflow (GITHUB_TOKEN-caused events never start workflow runs).
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          target="${{ steps.manifest.outputs.version }}"
-          merge_sha="${{ steps.verify_merge.outputs.merge_sha }}"
-          git show "${merge_sha}:CHANGELOG.md" > /tmp/CHANGELOG.md
-          cp /tmp/release-manifest.json "/tmp/release-manifest-v${target}.json"
-
-          release_args=(--title "v${target}" --notes-file /tmp/CHANGELOG.md)
-          if [[ "${{ steps.manifest.outputs.type }}" != "ga" ]]; then
-            release_args+=(--prerelease)
+          if [[ "${{ needs.resolve-release.outputs.is_draft }}" != "true" ]]; then
+            echo "Release v${{ steps.manifest.outputs.version }} is already published — treating as already completed."
+            exit 0
           fi
+          gh api --method PATCH \
+            "/repos/${{ github.repository }}/releases/${{ needs.resolve-release.outputs.release_id }}" \
+            -F draft=false --jq '.html_url'
 
-          if gh release view "v${target}" >/dev/null 2>&1; then
-            echo "GitHub release v${target} already exists — treating as already completed."
-          else
-            gh release create "v${target}" "/tmp/release-manifest-v${target}.json" "${release_args[@]}"
-          fi
+      - name: Re-draft release on failure
+        if: failure() && github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target="${{ needs.resolve-release.outputs.target }}"
+          gh api --method PATCH \
+            "/repos/${{ github.repository }}/releases/${{ needs.resolve-release.outputs.release_id }}" \
+            -F draft=true >/dev/null
+          git push --delete origin "v${target}" || true
+          echo "::error title=Publication failed::Release v${target} was reverted to draft and its tag deleted. Fix the cause and publish again."

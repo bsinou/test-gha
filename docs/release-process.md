@@ -3,32 +3,44 @@
 This repo implements a test harness for the two-phase release process used by
 wire-team-settings (ADR 0006): **PREPARE → (review) → PUBLISH**. Docker/Helm
 steps are mocked to log-only here since there's no real registry or S3 to
-push to — everything else (versioning, branching, git history, tags,
-GitHub releases) is real.
+push to — everything else (versioning, git history, tags, GitHub releases)
+is real.
+
+The `PREPARED` candidate is a **draft GitHub Release**: no branch, no commit.
+The changelog is the release body and the release manifest is a release
+asset — both belong to the release, not to the code.
 
 ## Overview
 
 ```
 operator                prepare-release.yml              publish-release.yml
   |                             |                                 |
-  |-- dispatch(source_branch, --->|                              |
-  |     type, version_bump)    |                                 |
+  |-- dispatch(source_branch, ->|                                 |
+  |     type, version_bump)     |                                 |
   |                             |-- compute version               |
+  |                             |-- fail if release v<V> exists   |
   |                             |-- generate changelog            |
-  |                             |-- commit (changelog + manifest) |
-  |                             |-- open PR, enable auto-merge    |
+  |                             |-- mock build / docker / helm    |
+  |                             |-- create DRAFT release          |
+  |                             |     body   = changelog          |
+  |                             |     asset  = release-manifest   |
+  |                             |     target = source_commit      |
   |                             |                                 |
-  |-- approve PR -------------->|                                 |
-  |                        (auto-merge completes) ---(pull_request:closed)-->|
-  |                                                                |-- verify merge commit
-  |                                                                |-- verify manifest
-  |                                                                |-- tag vX.Y.Z
+  |-- review draft, click "Publish release" ---(release:published)->|
+  |                                                                |-- download + verify manifest
+  |                                                                |-- verify candidate not stale
+  |                                                                |-- promote docker / helm (mock)
+  |                                                                |-- verify/create tag vX.Y.Z
   |                                                                |-- create release/X.Y (first GA of a minor)
-  |                                                                |-- create GitHub release (+ manifest asset)
 ```
 
-One approval — on the `pre-release/vX.Y.Z` PR — is the only manual step.
+One click — **Publish release** on the draft — is the only manual step.
 Everything else is automatic.
+
+`publish-release` also accepts a manual `workflow_dispatch` (with a `version`
+input) as a fallback if the automatic trigger is ever skipped, or if you'd
+rather verify and promote *before* the release goes public (see
+[Phase 2](#phase-2--publish-releaseyml) below).
 
 ## Phase 1 — `prepare-release.yml`
 
@@ -58,26 +70,30 @@ Steps, in order:
    - `alpha` / `beta` / `rc` → since the last **pre-release** tag of any
      channel, falling back to the last GA tag if this is the first
      pre-release of a new cycle.
-4. **Create prepare branch** — `pre-release/vX.Y.Z`, branched from
-   `source_commit` (not from whatever `source_branch`'s tip has drifted to
-   by this point).
+4. **Fail if a release already exists** — lists releases and filters for
+   `tag_name == "v<target>"` (drafts are not returned by the tag-lookup
+   endpoint, so this must list-and-filter rather than look up the tag
+   directly). If one is found — draft or published — the run fails with a
+   link to it, in both the log annotation and the step summary.
 5. **Generate changelog** — `bin/generate-release-changelog.js` (real script,
    copied from wire-team-settings, using the `generate-changelog` npm
-   package) writes `CHANGELOG.md` for the range `from_tag...source_commit`.
+   package) writes `CHANGELOG.md` for the range `from_tag...source_commit`,
+   copied to `/tmp/release-notes.md` for later use as the release body.
 6. **Build / push Docker / package Helm** — mocked; each logs what it would
    have done and produces a deterministic fake digest/sha256 so the manifest
    still has realistic-looking values to verify later.
-7. **Write release manifest + commit** — `release-manifest.json` (version,
-   type, source_branch, source_commit, mocked Docker/Helm coordinates, the
-   `prepare_run_id`) is written, and `CHANGELOG.md` + `release-manifest.json`
-   are committed together in a **single commit**: `chore(release): vX.Y.Z`.
-8. **Push prepare branch**, **open PR** (`pre-release/vX.Y.Z` → `source_branch`),
-   **enable auto-merge** (`gh pr merge --auto --merge`).
+7. **Write release manifest** — `release-manifest.json` (version, type,
+   source_branch, source_commit, mocked Docker/Helm coordinates, the
+   `prepare_run_id`) is written to `/tmp`. Nothing is committed.
+8. **Create draft release** — tagged `vX.Y.Z`, `--target <source_commit>`,
+   title `vX.Y.Z`, body = the changelog, with `release-manifest.json`
+   attached as an asset. Marked `--prerelease` for any `type` other than
+   `ga`. Re-checks for a race (another run creating the same tag
+   concurrently) immediately before creating, since GitHub allows multiple
+   drafts to share a `tag_name`.
 
-The PR sits queued until a human approves it (the `main` branch ruleset
-requires 1 approval and only allows merge commits — see
-`docs/setup/repo-settings.md`). Once approved, GitHub completes the merge on
-its own.
+The draft sits until a human reviews it and clicks **Publish release** (or
+deletes it, to abandon the candidate).
 
 ### Version computation
 
@@ -112,71 +128,84 @@ its own.
 ```
 
 It's `source_branch`'s tip **at the instant `prepare-release` started** —
-captured before the prepare branch, changelog, or manifest commit exist.
-Everything the workflow does afterwards happens *on top of* this commit, so
-by the time the PR is open, the prepare branch's tip and the eventual merge
-commit are different SHAs from it.
+captured before anything else happens. There is no intermediate commit
+anymore: the changelog and manifest live in the release, not in the repo, so
+`source_commit` is simply the commit the draft release targets.
 
 This matters because:
-- It's what actually gets **tagged**: `publish-release.yml` runs
-  `git tag "v${target}" "$source_commit"` — the release tag points at the
-  real reviewed code, not at the changelog/manifest bookkeeping commit.
+- It's what actually gets **tagged**: publishing the draft makes GitHub
+  create `refs/tags/vX.Y.Z` at the release's `target_commitish`, which *is*
+  `source_commit` (set via `--target` at creation time). `publish-release`'s
+  own tag-creation step is idempotent against this, in case the tag doesn't
+  exist yet (the manual fallback path) or already does (the automatic path).
 - It's the **integrity anchor** for publish-time verification:
-  `publish-release.yml` checks
-  `git merge-base --is-ancestor "$source_commit" "$merge_sha"` — i.e. the
-  manifest's recorded source commit really is an ancestor of the PR's merge
-  commit — before trusting anything else in the manifest.
+  `publish-release.yml` checks that `manifest.source_commit` equals the
+  release's `target_commitish` (the draft was not retargeted after
+  preparation), and that it is still an ancestor of `source_branch` (the
+  branch wasn't rewritten since preparation) — before trusting anything else
+  in the manifest.
 
 ## Phase 2 — `publish-release.yml`
 
 Triggered two ways:
-- **Automatically**, via `pull_request: closed` — but only acts when
-  `github.event.pull_request.merged == true` and the head ref starts with
-  `pre-release/` (see `resolve-pr`'s `if:`). This is the normal path.
-- **Manually**, via `workflow_dispatch` with a `pr_number` input — a fallback
-  for when the automatic trigger is skipped (e.g. the PAT/bypass setup isn't
-  in place; see `docs/setup/repo-settings.md` section 5).
+- **Automatically**, via `release: published` — fires whenever any release
+  transitions out of draft, including by a human clicking **Publish release**
+  on the GitHub UI. This is the normal path. On this path the release (and
+  its tag) are already public by the time the workflow starts verifying —
+  see the rollback step below.
+- **Manually**, via `workflow_dispatch` with a `version` input — a fallback
+  for when the automatic trigger is skipped, or when you'd rather verify and
+  promote *before* the release goes public. On this path the tag does not
+  exist yet; the workflow creates it, then flips the draft to published last.
 
-### Job 1 — `resolve-pr`
+### Job 1 — `resolve-release`
 
-Looks up the PR (`gh pr view`) and outputs its `state`, `merge_sha`,
-`base_ref`, `pr_number`. The `publish` job only runs `if:` this state is
-`MERGED`.
+Looks up the release by version (from the trigger event or the manual input),
+listing and filtering rather than using the tag-lookup endpoint (drafts are
+excluded from that endpoint). Fails if none is found, or if more than one
+release shares the tag. Outputs `release_id`, `is_draft`, `target_commitish`,
+and the manifest asset's API URL (its `browser_download_url` 404s for a
+draft).
 
 ### Job 2 — `publish`
 
-1. **Checkout base ref** (`source_branch`, full history).
-2. **Verify merge is a true merge commit** — exactly 2 parents. Squash/rebase
-   merges (1 parent) are rejected; combined with the branch ruleset only
-   allowing merge commits, this should never actually trigger, but the
-   workflow checks it independently rather than trusting the ruleset alone.
-3. **Read and verify release manifest** — reads `release-manifest.json` out
-   of the merge commit (`git show "$merge_sha:release-manifest.json"`), then
-   confirms `source_commit` is an ancestor of `merge_sha` (see above). All
-   manifest fields become step outputs.
-4. **Promote Docker image / Helm chart** — mocked; logs what it would have
+1. **Download the release manifest** from the asset — via the API URL with
+   `Accept: application/octet-stream` (not `gh release download`, which
+   doesn't work for drafts).
+2. **Read and verify release manifest** — checks `manifest.version` matches
+   the resolved release, and `manifest.source_commit` matches the release's
+   `target_commitish` (see [`source_commit`](#what-is-source_commit) above).
+   All manifest fields become step outputs.
+3. **Checkout** `source_branch`, full history.
+4. **Verify candidate is not stale** — confirms `source_commit` is still an
+   ancestor of `source_branch`'s current tip. If the branch was force-pushed
+   or rewritten since preparation, this fails with an explicit message rather
+   than trusting the manifest blindly.
+5. **Promote Docker image / Helm chart** — mocked; logs what it would have
    verified/promoted (candidate digest/sha256 match, no-rebuild promotion).
-5. **Create immutable release tag** — `vX.Y.Z` at `source_commit`. Idempotent:
+6. **Create immutable release tag** — `vX.Y.Z` at `source_commit`. Idempotent:
    an existing tag at the expected commit is a no-op; at a different commit
-   is a hard failure (refuses to move a release tag).
-6. **Create or verify `release/X.Y`** — only for `type=ga` where the version
+   is a hard failure (refuses to move a release tag). Always fetches tags
+   first, since on the automatic path GitHub may have just created it.
+7. **Create or verify `release/X.Y`** — only for `type=ga` where the version
    is `X.Y.0` (first GA of a new minor). Creates the maintenance branch at
    `source_commit`, or verifies an existing one matches.
-7. **Create GitHub release** — title `vX.Y.Z`, notes from the merge commit's
-   `CHANGELOG.md`, marked `--prerelease` for non-`ga` types. The release
-   manifest is attached as a release **asset**
-   (`release-manifest-vX.Y.Z.json`) rather than committed to `source_branch`
-   — the tag + release already are the durable record, so there's no need
-   for a second protected-branch PR just to archive the manifest.
+8. **Publish draft release** — flips `draft=false` on the release (a no-op if
+   it's already published, i.e. the automatic path). Uses `github.token`
+   deliberately: a `release: published` event caused by `GITHUB_TOKEN` never
+   starts another workflow run, so this cannot re-trigger `publish-release`
+   on itself.
+9. **Re-draft on failure** (automatic path only) — if any step above fails
+   after the release was already public, this reverts the release to draft
+   and deletes the tag it created, so a failed publication doesn't leave a
+   half-promoted release sitting in the public releases list.
 
 ## Branch naming
 
-Temporary branches created during the process use the `pre-release/` prefix
-(`pre-release/vX.Y.Z`), auto-deleted after merge (repo setting, see
-`docs/setup/repo-settings.md`).
+The release process creates **no branch** for the release candidate itself —
+only `release/X.Y`, and only for the first GA of a new minor line.
 
 ## See also
 
-`docs/setup/repo-settings.md` — the manual GitHub settings (branch ruleset,
-auto-merge, PAT for the bot identity) this process depends on, and why each
-one is needed.
+`docs/setup/repo-settings.md` — the manual GitHub settings this process
+depends on, and why each one is (or isn't, anymore) needed.

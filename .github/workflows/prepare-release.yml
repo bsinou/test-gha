@@ -1,9 +1,13 @@
 name: Prepare release
 
 # Test-harness mirror of wire-team-settings' prepare-release.yml (ADR 0006
-# PREPARED -> VALIDATED -> PUBLISHED process). Identical git/PR mechanics;
-# the Docker/Helm candidate "publication" steps are mocked to log-only since
-# this repo has no real registry/S3 to push to.
+# PREPARED -> VALIDATED -> PUBLISHED process). Identical version-computation
+# and integrity mechanics; the Docker/Helm candidate "publication" steps are
+# mocked to log-only since this repo has no real registry/S3 to push to.
+#
+# The PREPARED candidate is a draft GitHub Release: no branch, no commit.
+# The changelog becomes the release body and the release manifest becomes a
+# release asset — both belong to the release, not to the code.
 
 on:
   workflow_dispatch:
@@ -33,6 +37,10 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: prepare-release-${{ inputs.source_branch }}
+  cancel-in-progress: false
+
 jobs:
   prepare:
     name: Prepare release candidate
@@ -40,7 +48,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
-      pull-requests: write
 
     steps:
       - name: Checkout
@@ -78,47 +85,40 @@ jobs:
           echo "from_tag=$from_tag" >> "$GITHUB_OUTPUT"
           echo "Target version: $target (changelog from $from_tag)"
 
-      - name: Fail if release PR already exists
+      - name: Fail if a release already exists for this version
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_BRANCH: pre-release/v${{ steps.version.outputs.target }}
+          TARGET: ${{ steps.version.outputs.target }}
         run: |
           set -euo pipefail
 
-          pr_json="$(
-            gh pr list \
-              --head "$RELEASE_BRANCH" \
-              --state open \
-              --json number,url \
-              --limit 1
+          # /releases/tags/<tag> does not return drafts — must list and filter.
+          matches="$(
+            gh api --paginate "/repos/${{ github.repository }}/releases" \
+              --jq "[.[] | select(.tag_name == \"v${TARGET}\") | {url: .html_url, draft: .draft}]"
           )"
+          count="$(jq 'length' <<<"$matches")"
 
-          pr_number="$(echo "$pr_json" | jq -r '.[0].number // empty')"
-          pr_url="$(echo "$pr_json" | jq -r '.[0].url // empty')"
+          if [[ "$count" -gt 0 ]]; then
+            url="$(jq -r '.[0].url' <<<"$matches")"
+            state="$(jq -r 'if .[0].draft then "draft" else "published" end' <<<"$matches")"
 
-          if [[ -n "$pr_number" ]]; then
-            echo "::error title=Release PR already exists::PR #${pr_number} already exists for branch ${RELEASE_BRANCH}: ${pr_url}"
+            echo "::error title=Release already exists::A ${state} release already exists for v${TARGET}: ${url}"
 
             {
               echo "### Release already in progress"
               echo ""
-              echo "A release PR already exists for \`${RELEASE_BRANCH}\`:"
+              echo "A ${state} release already exists for \`v${TARGET}\`:"
               echo ""
-              echo "➡️ [PR #${pr_number}](${pr_url})"
+              echo "➡️ [v${TARGET}](${url})"
+              echo ""
+              echo "Delete the draft to re-prepare, or publish it to complete the release."
             } >> "$GITHUB_STEP_SUMMARY"
 
             exit 1
           fi
 
-          echo "No existing PR found for ${RELEASE_BRANCH}."
-
-      - name: Configure git
-        run: |
-          git config user.email "zebot@users.noreply.github.com"
-          git config user.name "Zebot"
-
-      - name: Create prepare branch
-        run: git checkout -b "pre-release/v${{ steps.version.outputs.target }}" "${{ steps.source.outputs.sha }}"
+          echo "No existing release found for v${TARGET}."
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -129,7 +129,10 @@ jobs:
         run: npm ci
 
       - name: Generate changelog
-        run: node bin/generate-release-changelog.js "${{ steps.version.outputs.from_tag }}" "${{ steps.source.outputs.sha }}"
+        run: |
+          set -euo pipefail
+          node bin/generate-release-changelog.js "${{ steps.version.outputs.from_tag }}" "${{ steps.source.outputs.sha }}"
+          cp CHANGELOG.md /tmp/release-notes.md
 
       - name: Build production bundle (mocked — no real build in this test repo)
         env:
@@ -165,7 +168,7 @@ jobs:
       - name: Write release manifest
         run: |
           set -euo pipefail
-          cat > release-manifest.json <<JSON
+          cat > /tmp/release-manifest.json <<JSON
           {
             "version": "${{ steps.version.outputs.target }}",
             "type": "${{ inputs.type }}",
@@ -179,31 +182,53 @@ jobs:
             "prepare_run_id": "${{ github.run_id }}"
           }
           JSON
-          git add CHANGELOG.md release-manifest.json
-          git commit -m "chore(release): v${{ steps.version.outputs.target }}"
+          cat /tmp/release-manifest.json
 
-      - name: Push prepare branch
-        run: git push origin "pre-release/v${{ steps.version.outputs.target }}"
-
-      - name: Create pull request
+      - name: Create draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.version.outputs.target }}
         run: |
-          gh pr create \
-            --title "chore: Prepare release ${{ steps.version.outputs.target }}" \
-            --body "Automated release preparation for \`${{ steps.version.outputs.target }}\` (\`${{ inputs.type }}\`) from \`${{ inputs.source_branch }}\` @ \`${{ steps.source.outputs.sha }}\`.
+          set -euo pipefail
 
-          [MOCK] Candidate artifacts are simulated in this test repo (no real registry/S3 push), recorded in \`release-manifest.json\`:
-          - Docker: \`${{ steps.docker.outputs.repository }}:${{ steps.docker.outputs.candidate_tag }}\` (\`${{ steps.docker.outputs.digest }}\`)
-          - Helm: \`${{ steps.helm.outputs.candidate_path }}\` (sha256 \`${{ steps.helm.outputs.sha256 }}\`)
+          # Re-check right before creating: GitHub permits multiple drafts with
+          # the same tag_name, so create-without-check can silently duplicate.
+          count="$(gh api --paginate "/repos/${{ github.repository }}/releases" \
+            --jq "[.[] | select(.tag_name == \"v${TARGET}\")] | length")"
+          if [[ "$count" -ne 0 ]]; then
+            echo "::error title=Race detected::A release for v${TARGET} appeared during this run — aborting"
+            exit 1
+          fi
 
-          **This PR must be merged as a merge commit.** Squash or rebase merges discard the commit ancestry that \`publish-release\` relies on to verify the candidate, and will be rejected at publish time.
+          {
+            echo "Release candidate for \`${TARGET}\` (\`${{ inputs.type }}\`) from \`${{ inputs.source_branch }}\` @ \`${{ steps.source.outputs.sha }}\`."
+            echo ""
+            echo "[MOCK] Candidate artifacts are simulated in this test repo (no real registry/S3 push), recorded in the \`release-manifest.json\` asset:"
+            echo "- Docker: \`${{ steps.docker.outputs.repository }}:${{ steps.docker.outputs.candidate_tag }}\` (\`${{ steps.docker.outputs.digest }}\`)"
+            echo "- Helm: \`${{ steps.helm.outputs.candidate_path }}\` (sha256 \`${{ steps.helm.outputs.sha256 }}\`)"
+            echo ""
+            echo "**Review this draft, then click _Publish release_** — that creates the tag \`v${TARGET}\` at \`${{ steps.source.outputs.sha }}\` and runs \`publish-release\`, which promotes the artifacts above without rebuilding. To abandon this candidate, delete this draft."
+            echo ""
+            echo "---"
+            echo ""
+            cat /tmp/release-notes.md
+          } > /tmp/release-body.md
 
-          Auto-merge is enabled — approve this PR and it will merge and publish itself." \
-            --base "${{ inputs.source_branch }}" \
-            --head "pre-release/v${{ steps.version.outputs.target }}"
+          args=(--draft
+                --target "${{ steps.source.outputs.sha }}"
+                --title "v${TARGET}"
+                --notes-file /tmp/release-body.md)
+          if [[ "${{ inputs.type }}" != "ga" ]]; then args+=(--prerelease); fi
 
-      - name: Enable auto-merge
-        env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
-        run: gh pr merge --auto --merge "pre-release/v${{ steps.version.outputs.target }}"
+          gh release create "v${TARGET}" "${args[@]}" /tmp/release-manifest.json
+
+          url="$(gh api --paginate "/repos/${{ github.repository }}/releases" \
+            --jq "[.[] | select(.tag_name == \"v${TARGET}\")][0].html_url")"
+
+          {
+            echo "### Draft release ready"
+            echo ""
+            echo "➡️ [v${TARGET}](${url})"
+            echo ""
+            echo "Review it and click **Publish release** to complete the release."
+          } >> "$GITHUB_STEP_SUMMARY"
