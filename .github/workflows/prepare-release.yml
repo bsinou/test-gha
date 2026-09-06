@@ -8,11 +8,16 @@ name: Prepare release
 on:
   workflow_dispatch:
     inputs:
-      source_ref:
-        description: 'Branch to release from: main, or a maintained release/X.Y line'
-        type: string
+      source_branch:
+        description: 'Branch to release from'
+        required: true
+        type: choice
         default: main
-        required: false
+        options:
+          - main
+          - release/0.1
+          - release/0.2
+          - release/1.0
       type:
         description: 'Release channel'
         type: choice
@@ -41,7 +46,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v7
         with:
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ inputs.source_branch }}
           fetch-depth: 0
 
       - name: Resolve source commit
@@ -50,23 +55,23 @@ jobs:
           set -euo pipefail
           sha=$(git rev-parse HEAD)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Resolved source_ref '${{ inputs.source_ref }}' to $sha"
+          echo "Resolved source_branch '${{ inputs.source_branch }}' to $sha"
 
       - name: Compute target version
         id: version
         run: |
           set -euo pipefail
-          target=$(./bin/compute-release-version.sh "${{ inputs.source_ref }}" "${{ inputs.type }}" "${{ inputs.version_bump }}")
+          target=$(./bin/compute-release-version.sh "${{ inputs.source_branch }}" "${{ inputs.type }}" "${{ inputs.version_bump }}")
 
           # Changelog boundary: GA releases summarize everything since the last
           # GA; pre-releases summarize everything since the last pre-release
           # (any channel), falling back to the last GA for the first pre-release
           # of a new cycle.
           if [[ "${{ inputs.type }}" == "ga" ]]; then
-            from_tag=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --exclude "v*-*" --abbrev=0 "origin/${{ inputs.source_ref }}")
+            from_tag=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --exclude "v*-*" --abbrev=0 "origin/${{ inputs.source_branch }}")
           else
-            from_tag=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*-*" --abbrev=0 "origin/${{ inputs.source_ref }}" 2>/dev/null || \
-              git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --exclude "v*-*" --abbrev=0 "origin/${{ inputs.source_ref }}")
+            from_tag=$(git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*-*" --abbrev=0 "origin/${{ inputs.source_branch }}" 2>/dev/null || \
+              git describe --tags --match "v[0-9]*.[0-9]*.[0-9]*" --exclude "v*-*" --abbrev=0 "origin/${{ inputs.source_branch }}")
           fi
 
           echo "target=$target" >> "$GITHUB_OUTPUT"
@@ -130,7 +135,7 @@ jobs:
           {
             "version": "${{ steps.version.outputs.target }}",
             "type": "${{ inputs.type }}",
-            "source_ref": "${{ inputs.source_ref }}",
+            "source_branch": "${{ inputs.source_branch }}",
             "source_commit": "${{ steps.source.outputs.sha }}",
             "docker_repository": "${{ steps.docker.outputs.repository }}",
             "docker_candidate_tag": "${{ steps.docker.outputs.candidate_tag }}",
@@ -152,7 +157,7 @@ jobs:
         run: |
           gh pr create \
             --title "chore: Prepare release ${{ steps.version.outputs.target }}" \
-            --body "Automated release preparation for \`${{ steps.version.outputs.target }}\` (\`${{ inputs.type }}\`) from \`${{ inputs.source_ref }}\` @ \`${{ steps.source.outputs.sha }}\`.
+            --body "Automated release preparation for \`${{ steps.version.outputs.target }}\` (\`${{ inputs.type }}\`) from \`${{ inputs.source_branch }}\` @ \`${{ steps.source.outputs.sha }}\`.
 
           [MOCK] Candidate artifacts are simulated in this test repo (no real registry/S3 push), recorded in \`release-manifest.json\`:
           - Docker: \`${{ steps.docker.outputs.repository }}:${{ steps.docker.outputs.candidate_tag }}\` (\`${{ steps.docker.outputs.digest }}\`)
@@ -161,7 +166,7 @@ jobs:
           **This PR must be merged as a merge commit.** Squash or rebase merges discard the commit ancestry that \`publish-release\` relies on to verify the candidate, and will be rejected at publish time.
 
           Auto-merge is enabled — approve this PR and it will merge and publish itself." \
-            --base "${{ inputs.source_ref }}" \
+            --base "${{ inputs.source_branch }}" \
             --head "pre-release/v${{ steps.version.outputs.target }}"
 
       - name: Enable auto-merge
