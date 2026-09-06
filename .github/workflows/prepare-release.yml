@@ -220,10 +220,14 @@ jobs:
                 --notes-file /tmp/release-body.md)
           if [[ "${{ inputs.type }}" != "ga" ]]; then args+=(--prerelease); fi
 
-          gh release create "v${TARGET}" "${args[@]}" /tmp/release-manifest.json
-
-          url="$(gh api --paginate "/repos/${{ github.repository }}/releases" \
-            --jq "[.[] | select(.tag_name == \"v${TARGET}\")][0].html_url")"
+          # gh release create prints the release's URL on success — use that
+          # directly. Re-querying the releases list right after creation is
+          # unreliable: it can momentarily miss the just-created release
+          # (list-endpoint propagation lag), and "gh api --jq" silently
+          # returns empty (not an error) when nothing matches, which would
+          # produce an empty markdown link — one that browsers resolve to
+          # the current page instead of failing visibly.
+          url="$(gh release create "v${TARGET}" "${args[@]}" /tmp/release-manifest.json)"
 
           {
             echo "### Draft release ready"
