@@ -78,6 +78,40 @@ jobs:
           echo "from_tag=$from_tag" >> "$GITHUB_OUTPUT"
           echo "Target version: $target (changelog from $from_tag)"
 
+      - name: Fail if release PR already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: pre-release/v${{ steps.version.outputs.target }}
+        run: |
+          set -euo pipefail
+
+          pr_json="$(
+            gh pr list \
+              --head "$RELEASE_BRANCH" \
+              --state open \
+              --json number,url \
+              --limit 1
+          )"
+
+          pr_number="$(echo "$pr_json" | jq -r '.[0].number // empty')"
+          pr_url="$(echo "$pr_json" | jq -r '.[0].url // empty')"
+
+          if [[ -n "$pr_number" ]]; then
+            echo "::error title=Release PR already exists::PR #${pr_number} already exists for branch ${RELEASE_BRANCH}: ${pr_url}"
+
+            {
+              echo "### Release already in progress"
+              echo ""
+              echo "A release PR already exists for \`${RELEASE_BRANCH}\`:"
+              echo ""
+              echo "➡️ [PR #${pr_number}](${pr_url})"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit 1
+          fi
+
+          echo "No existing PR found for ${RELEASE_BRANCH}."
+
       - name: Configure git
         run: |
           git config user.email "zebot@users.noreply.github.com"
